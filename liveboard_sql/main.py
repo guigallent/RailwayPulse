@@ -1,13 +1,36 @@
 import os
+import getpass
 import sqlite3
 from src.clean import read_csv_file, drop_empty_columns
 from src.build import build_database, load_data_to_database
+from src.fetch import download_gtfs_feed, extract_local_zip, API_URL
 
-# Anchor all paths to this script's location, so it works regardless of
-# which directory you run "python main.py" from.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data", "raw", "sncb")
 DB_PATH = os.path.join(BASE_DIR, "data", "railwaypulse.db")
+LOCAL_ZIP_PATH = os.path.join(BASE_DIR, "data", "raw", "sncb", "railwaypulse.zip")
+
+# Ask the user whether to reuse the bundled GTFS zip or fetch a fresh one from the API
+choice = input(
+    "Use (1) the existing local .zip file, or (2) fetch the latest feed from the API? [1/2]: "
+).strip()
+
+if choice == "2":
+    # Check the environment first so people who *have* set BMC_API_KEY
+    # (e.g. via .env) aren't prompted unnecessarily; everyone else is
+    # asked to paste their own key in on the spot.
+    api_key = os.environ.get("BMC_API_KEY") or getpass.getpass(
+        "Enter your BMC API key (input hidden, get your own at "
+        "https://data.belgianmobility.io/en/data.html): "
+    )
+    if not api_key:
+        raise ValueError("No API key provided — please run again and enter a valid key.")
+
+    download_gtfs_feed(API_URL, api_key, DATA_DIR)
+elif choice == "1":
+    extract_local_zip(LOCAL_ZIP_PATH, DATA_DIR)
+else:
+    raise ValueError("Invalid choice — please run again and enter 1 or 2.")
 
 # Load data from GTFS .txt files using the stdlib csv module
 
