@@ -1,7 +1,6 @@
 import os
-import pandas as pd
 import sqlite3
-from src.clean import drop_empty_columns
+from src.clean import read_csv_file, drop_empty_columns
 from src.build import build_database, load_data_to_database
 
 # Anchor all paths to this script's location, so it works regardless of
@@ -10,23 +9,23 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data", "raw", "sncb")
 DB_PATH = os.path.join(BASE_DIR, "data", "railwaypulse.db")
 
-# Load data from CSV files
+# Load data from GTFS .txt files using the stdlib csv module
 
-calendar_dates = pd.read_csv(os.path.join(DATA_DIR, "calendar_dates.txt"))
+calendar_dates = read_csv_file(os.path.join(DATA_DIR, "calendar_dates.txt"))
 print("Loaded calendar_dates.txt")
-calendar = pd.read_csv(os.path.join(DATA_DIR, "calendar.txt"))
+calendar = read_csv_file(os.path.join(DATA_DIR, "calendar.txt"))
 print("Loaded calendar.txt")
-routes = pd.read_csv(os.path.join(DATA_DIR, "routes.txt"))
+routes = read_csv_file(os.path.join(DATA_DIR, "routes.txt"))
 print("Loaded routes.txt")
-stop_times = pd.read_csv(os.path.join(DATA_DIR, "stop_times.txt"))
+stop_times = read_csv_file(os.path.join(DATA_DIR, "stop_times.txt"))
 print("Loaded stop_times.txt")
-stops = pd.read_csv(os.path.join(DATA_DIR, "stops.txt"))
+stops = read_csv_file(os.path.join(DATA_DIR, "stops.txt"))
 print("Loaded stops.txt")
-transfers = pd.read_csv(os.path.join(DATA_DIR, "transfers.txt"))
+transfers = read_csv_file(os.path.join(DATA_DIR, "transfers.txt"))
 print("Loaded transfers.txt")
-translations = pd.read_csv(os.path.join(DATA_DIR, "translations.txt"))
+translations = read_csv_file(os.path.join(DATA_DIR, "translations.txt"))
 print("Loaded translations.txt")
-trips = pd.read_csv(os.path.join(DATA_DIR, "trips.txt"))
+trips = read_csv_file(os.path.join(DATA_DIR, "trips.txt"))
 print("Loaded trips.txt")
 
 # Delete empty columns with no values
