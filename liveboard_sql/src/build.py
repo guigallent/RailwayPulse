@@ -1,4 +1,81 @@
 import sqlite3
+from src.clean import prepare_rows
+
+# Column definitions per table, in schema order, used to cast raw CSV
+# string values to the right SQL type before insertion. This is the only
+# thing standing in for pandas' automatic dtype handling.
+TABLE_SCHEMAS = {
+    "routes": [
+        ("route_id", "str"),
+        ("agency_id", "str"),
+        ("route_short_name", "str"),
+        ("route_long_name", "str"),
+        ("route_type", "int"),
+        ("route_color", "str"),
+        ("route_text_color", "str"),
+    ],
+    "calendar": [
+        ("service_id", "str"),
+        ("monday", "int"),
+        ("tuesday", "int"),
+        ("wednesday", "int"),
+        ("thursday", "int"),
+        ("friday", "int"),
+        ("saturday", "int"),
+        ("sunday", "int"),
+        ("start_date", "str"),
+        ("end_date", "str"),
+    ],
+    "stops": [
+        ("stop_id", "str"),
+        ("stop_name", "str"),
+        ("stop_lat", "float"),
+        ("stop_lon", "float"),
+        ("location_type", "int"),
+        ("parent_station", "str"),
+        ("platform_code", "str"),
+        ("stop_desc", "str"),
+    ],
+    "calendar_dates": [
+        ("service_id", "str"),
+        ("date", "str"),
+        ("exception_type", "int"),
+    ],
+    "trips": [
+        ("route_id", "str"),
+        ("service_id", "str"),
+        ("trip_id", "str"),
+        ("trip_headsign", "str"),
+        ("block_id", "str"),
+        ("bikes_allowed", "int"),
+        ("wheelchair_accessible", "int"),
+        ("trip_short_name", "str"),
+    ],
+    "stop_times": [
+        ("trip_id", "str"),
+        ("arrival_time", "str"),
+        ("departure_time", "str"),
+        ("drop_off_type", "int"),
+        ("pickup_type", "int"),
+        ("stop_id", "str"),
+        ("stop_sequence", "int"),
+    ],
+    "transfers": [
+        ("from_stop_id", "str"),
+        ("to_stop_id", "str"),
+        ("transfer_type", "int"),
+        ("min_transfer_time", "int"),
+        ("from_trip_id", "str"),
+        ("to_trip_id", "str"),
+    ],
+    "translations": [
+        ("table_name", "str"),
+        ("field_name", "str"),
+        ("field_value", "str"),
+        ("language", "str"),
+        ("translation", "str"),
+    ],
+}
 
 
 def build_database(conn):
@@ -148,24 +225,45 @@ def build_database(conn):
     print("All tables committed to database")
 
 
-def load_data_to_database(conn, calendar_dates, calendar, routes, stop_times, stops, transfers, trips, translations):
-    # Insert in dependency order (parents before children) so this also
-    # works cleanly if you later enable PRAGMA foreign_keys = ON.
-    routes.to_sql("routes", conn, if_exists="append", index=False)
-    print("Loaded data into: routes")
-    calendar.to_sql("calendar", conn, if_exists="append", index=False)
-    print("Loaded data into: calendar")
-    stops.to_sql("stops", conn, if_exists="append", index=False)
-    print("Loaded data into: stops")
-    calendar_dates.to_sql("calendar_dates", conn, if_exists="append", index=False)
-    print("Loaded data into: calendar_dates")
-    trips.to_sql("trips", conn, if_exists="append", index=False)
-    print("Loaded data into: trips")
-    stop_times.to_sql("stop_times", conn, if_exists="append", index=False)
-    print("Loaded data into: stop_times")
-    transfers.to_sql("transfers", conn, if_exists="append", index=False)
-    print("Loaded data into: transfers")
-    translations.to_sql("translations", conn, if_exists="append", index=False)
-    print("Loaded data into: translations")
+def insert_rows(conn, table_name, rows):
+    """Inserts a list of dicts into a table using raw sqlite3 executemany.
+    """
+    if not rows:
+        print(f"  -> No rows to insert into {table_name}, skipping")
+        return
+
+    columns = list(rows[0].keys())
+    placeholders = ", ".join(["?"] * len(columns))
+    col_names = ", ".join(columns)
+    sql = f"INSERT INTO {table_name} ({col_names}) VALUES ({placeholders})"
+
+    values = [tuple(row[c] for c in columns) for row in rows]
+    conn.executemany(sql, values)
+
+
+def load_data_to_database(conn, calendar_dates, calendar, routes, stop_times,
+                           stops, transfers, trips, translations):
+    """Casts each raw (string-valued) row list to its table's schema and
+    inserts it via raw SQL, in dependency order (parents before children).
+    """
+    raw_tables = {
+        "routes": routes,
+        "calendar": calendar,
+        "stops": stops,
+        "calendar_dates": calendar_dates,
+        "trips": trips,
+        "stop_times": stop_times,
+        "transfers": transfers,
+        "translations": translations,
+    }
+
+    # Dependency order matters for FK integrity even without PRAGMA
+    # foreign_keys = ON.
+    for table_name in ["routes", "calendar", "stops", "calendar_dates",
+                        "trips", "stop_times", "transfers", "translations"]:
+        prepared = prepare_rows(raw_tables[table_name], TABLE_SCHEMAS[table_name])
+        insert_rows(conn, table_name, prepared)
+        print(f"Loaded data into: {table_name}")
+
     conn.commit()
     print("All data committed to database")
