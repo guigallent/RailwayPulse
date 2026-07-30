@@ -1,219 +1,156 @@
--- 1. The Peak Hour Problem: What hour of the day experiences the highest volume of scheduled train departures across the entire network?
+-- ═══════════════════════════════════════════════════════════════════════════
+-- RAILPULSE CLOUD DATA WAREHOUSE: UNIFIED GTFS STATIC & REALTIME SCHEMA
+-- Target DB: Azure SQL Serverless
+-- ═══════════════════════════════════════════════════════════════════════════
 
-SELECT
-    strftime('%H', st.departure_time) AS departure_hour,
-    COUNT(*) AS departure_count
-FROM
-    stop_times st
-JOIN
-    trips t ON st.trip_id = t.trip_id
-JOIN
-    routes r ON t.route_id = r.route_id
-WHERE
-    r.route_type = 2
-GROUP BY
-    departure_hour
-ORDER BY
-    departure_count DESC
-LIMIT 3
+-- ── 0. Drop existing tables (Facts first, then Dimensions) ─────────────────
+IF OBJECT_ID('dbo.trip_stop_updates', 'U')       IS NOT NULL DROP TABLE dbo.trip_stop_updates;
+IF OBJECT_ID('dbo.alert_informed_entities', 'U') IS NOT NULL DROP TABLE dbo.alert_informed_entities;
+IF OBJECT_ID('dbo.alert_texts', 'U')             IS NOT NULL DROP TABLE dbo.alert_texts;
+IF OBJECT_ID('dbo.alert_active_periods', 'U')    IS NOT NULL DROP TABLE dbo.alert_active_periods;
+IF OBJECT_ID('dbo.trip_updates', 'U')            IS NOT NULL DROP TABLE dbo.trip_updates;
+IF OBJECT_ID('dbo.service_alerts', 'U')          IS NOT NULL DROP TABLE dbo.service_alerts;
 
--- Result of the query: [('10', 136043), ('09', 132435), ('11', 132222)]
+IF OBJECT_ID('dbo.dim_trips', 'U')               IS NOT NULL DROP TABLE dbo.dim_trips;
+IF OBJECT_ID('dbo.dim_routes', 'U')              IS NOT NULL DROP TABLE dbo.dim_routes;
+IF OBJECT_ID('dbo.dim_stations', 'U')            IS NOT NULL DROP TABLE dbo.dim_stations;
+GO
 
+-- ═══════════════════════ DIMENSION TABLES (GTFS-STATIC) ═══════════════════════
 
--- 2. Platform Bottlenecks: Identify the top 3 busiest platforms in Brussels-Central.
+-- ── 1. dim_stations — Station & Platform Metadata ─────────────────────────
+CREATE TABLE dbo.dim_stations (
+    stop_id             VARCHAR(50)   NOT NULL,   -- GTFS stop_id, e.g. '8813003'
+    stop_name           NVARCHAR(150) NOT NULL,   -- e.g. 'Brussel-Centraal / Bruxelles-Central'
+    parent_station      VARCHAR(50)   NULL,       -- Parent hub ID for platforms
+    platform_code       VARCHAR(20)   NULL,       -- Platform number (e.g. '3', '4')
+    wheelchair_boarding INT           NULL,       -- 0 = No info, 1 = Accessible, 2 = Not accessible
+    CONSTRAINT PK_dim_stations PRIMARY KEY (stop_id)
+);
+GO
 
-SELECT
-    s.platform_code,
-    COUNT(*) AS platform_usage_count
-FROM
-    stop_times st
-JOIN
-    stops s ON st.stop_id = s.stop_id
-WHERE
-    s.parent_station IN (
-        SELECT stop_id
-        FROM stops
-        WHERE stop_name LIKE '%Bruxelles-Central%'
-    )
-    AND s.platform_code IS NOT NULL
-GROUP BY
-    s.platform_code
-ORDER BY
-    platform_usage_count DESC
-LIMIT 3
+-- ── 2. dim_routes — Line & Route Metadata ──────────────────────────────────
+CREATE TABLE dbo.dim_routes (
+    route_id            VARCHAR(50)   NOT NULL,   -- e.g. 'gr:nmbssncb:10'
+    agency_id           VARCHAR(30)   NULL,
+    route_short_name    NVARCHAR(50)  NULL,       -- e.g. 'IC-01'
+    route_long_name     NVARCHAR(200) NULL,       -- e.g. 'Eupen -- Oostende'
+    route_type          INT           NOT NULL,   -- GTFS route type (2 = Rail)
+    CONSTRAINT PK_dim_routes PRIMARY KEY (route_id)
+);
+GO
 
--- Result of the query: [('3', 11982), ('4', 10515), ('2', 7473)]
-
-
--- 3. Busiest Morning Destinations: Find the top 3 most frequent terminal destinations (trip_headsign) for all morning trips that depart before 12:00:00 PM.
-
-SELECT
-    t.trip_headsign,
-    COUNT(DISTINCT t.trip_id) AS trip_count
-FROM
-    trips t
-JOIN
-    stop_times st ON t.trip_id = st.trip_id
-WHERE
-    st.stop_sequence = (
-        SELECT MIN(st2.stop_sequence)
-        FROM stop_times st2
-        WHERE st2.trip_id = st.trip_id
-    )
-    AND st.departure_time < '12:00:00'
-GROUP BY
-    t.trip_headsign
-ORDER BY
-    trip_count DESC
-LIMIT 3
-
--- Result of the query: [('Anvers-Central', 3930), ('Bruxelles-Midi', 3150), ('Louvain', 2505)]
+-- ── 3. dim_trips — Scheduled Trip Reference ───────────────────────────────
+CREATE TABLE dbo.dim_trips (
+    trip_id             VARCHAR(100)  NOT NULL,   -- GTFS static trip_id
+    route_id            VARCHAR(50)   NOT NULL,
+    service_id          VARCHAR(50)   NOT NULL,   -- Operating calendar service key
+    trip_headsign       NVARCHAR(150) NULL,       -- Destination shown on train (e.g. 'Anvers-Central')
+    bikes_allowed       INT           NULL,       -- 0 = No info, 1 = Allowed, 2 = Not allowed
+    wheelchair_accessible INT         NULL,       -- 0 = No info, 1 = Accessible, 2 = Not accessible
+    CONSTRAINT PK_dim_trips PRIMARY KEY (trip_id),
+    CONSTRAINT FK_dim_trips_routes FOREIGN KEY (route_id) REFERENCES dbo.dim_routes (route_id)
+);
+GO
 
 
--- 4. Service Frequency: Classify each active service ID into a weekly frequency category using a CASE WHEN statement. 
--- If a service operates 5 or more days a week, classify it as "High Frequency"; 
--- if 2–4 days, "Medium Frequency"; 
--- and if 1 day or completely irregular, "Low Frequency/Special". 
--- Show the percentage of services in each category.
+-- ═══════════════════════ FACT TABLES (GTFS-REALTIME) ═══════════════════════
 
+-- ── 4. trip_updates — Liveboard Trip Header Telemetry ─────────────────────
+CREATE TABLE dbo.trip_updates (
+    update_pk                   INT IDENTITY(1,1) NOT NULL,
+    entity_id                   VARCHAR(100)  NOT NULL,   -- GTFS-RT entity ID
+    trip_id                     VARCHAR(100)  NOT NULL,   -- Links to dim_trips.trip_id
+    route_id                    VARCHAR(50)   NULL,       -- Links to dim_routes.route_id
+    start_date                  VARCHAR(8)    NULL,       -- YYYYMMDD
+    start_time                  VARCHAR(8)    NULL,       -- HH:MM:SS
+    trip_schedule_relationship  INT           NULL,       -- GTFS-RT numeric code (0 = SCHEDULED)
+    vehicle_id                  VARCHAR(50)   NULL,
+    vehicle_label               VARCHAR(50)   NULL,
+    license_plate               VARCHAR(20)   NULL,
+    overall_delay               INT           NULL,       -- Delay in seconds across entire trip
+    update_timestamp            DATETIME2     NULL,       -- Feed snapshot generation time (UTC)
+    fetched_at                  DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT PK_trip_updates PRIMARY KEY (update_pk)
+);
+GO
 
--- NOTES: calendar.monday..sunday is all 0 in this feed, so the weekly pattern has
--- to be derived from calendar_dates instead. This uses each service's MODAL
--- (most common) days-per-active-week, so one unusual week (a holiday dip,
--- a one-off bulge) doesn't distort its classification.
+-- ── 5. trip_stop_updates — Station-Level Arrival/Departure Delays ─────────
+CREATE TABLE dbo.trip_stop_updates (
+    id                      INT IDENTITY(1,1) NOT NULL,
+    update_pk                INT           NOT NULL,   -- Parent FK to trip_updates
+    stop_sequence           INT           NOT NULL,   -- Sequential stop index in trip
+    stop_id                  VARCHAR(50)   NOT NULL,   -- Links to dim_stations.stop_id
+    arrival_time             DATETIME2     NULL,       -- Scheduled/estimated arrival (UTC)
+    arrival_delay            INT           NULL,       -- Arrival delay in seconds
+    departure_time           DATETIME2     NULL,       -- Scheduled/estimated departure (UTC)
+    departure_delay          INT           NULL,       -- Departure delay in seconds
+    schedule_relationship    INT           NULL,
+    CONSTRAINT PK_trip_stop_updates PRIMARY KEY (id),
+    CONSTRAINT FK_stop_update_trip FOREIGN KEY (update_pk)
+        REFERENCES dbo.trip_updates (update_pk) ON DELETE CASCADE
+);
+GO
 
-WITH service_dates AS (
-    -- Convert GTFS YYYYMMDD strings to ISO dates SQLite's date functions understand
-    SELECT
-        service_id,
-        date(substr(date, 1, 4) || '-' || substr(date, 5, 2) || '-' || substr(date, 7, 2)) AS iso_date
-    FROM calendar_dates
-    WHERE exception_type = 1  -- ADDED dates only
-),
-service_weeks AS (
-    -- Bucket each date into a Monday-Sunday week, counted from a fixed
-    -- Monday epoch (2024-01-01) rather than strftime('%W'), which resets
-    -- at each Jan 1 and would split a week straddling year-end in two.
-    SELECT
-        service_id,
-        CAST((julianday(iso_date) - julianday('2024-01-01')) / 7 AS INTEGER) AS week_bucket
-    FROM service_dates
-),
-days_per_week AS (
-    -- How many days this service ran in each of its active weeks
-    SELECT
-        service_id,
-        week_bucket,
-        COUNT(*) AS operating_days
-    FROM service_weeks
-    GROUP BY service_id, week_bucket
-),
-mode_counts AS (
-    -- How often each days-per-week value recurs for this service
-    SELECT
-        service_id,
-        operating_days,
-        COUNT(*) AS weeks_with_this_count
-    FROM days_per_week
-    GROUP BY service_id, operating_days
-),
-ranked_modes AS (
-    -- Pick the most frequent value per service; ties broken toward the
-    -- higher day count
-    SELECT
-        service_id,
-        operating_days,
-        ROW_NUMBER() OVER (
-            PARTITION BY service_id
-            ORDER BY weeks_with_this_count DESC, operating_days DESC
-        ) AS rn
-    FROM mode_counts
-),
-service_frequency AS (
-    SELECT service_id, operating_days AS typical_days_per_week
-    FROM ranked_modes
-    WHERE rn = 1
-),
-classified AS (
-    SELECT
-        service_id,
-        CASE
-            WHEN typical_days_per_week >= 5 THEN 'High Frequency'
-            WHEN typical_days_per_week >= 2 THEN 'Medium Frequency'
-            ELSE 'Low Frequency/Special'
-        END AS frequency_category
-    FROM service_frequency
-)
-SELECT
-    frequency_category,
-    COUNT(*) AS service_count,
-    ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 2) AS percentage
-FROM classified
-GROUP BY frequency_category
-ORDER BY
-    CASE frequency_category
-        WHEN 'High Frequency' THEN 1
-        WHEN 'Medium Frequency' THEN 2
-        ELSE 3
-    END;
+-- ── 6. service_alerts — Live Network Disruption Events ────────────────────
+CREATE TABLE dbo.service_alerts (
+    alert_pk        INT IDENTITY(1,1) NOT NULL,
+    entity_id       VARCHAR(100)  NOT NULL,
+    cause           INT           NULL,         -- GTFS-RT alert cause code
+    effect          INT           NULL,         -- GTFS-RT alert effect code (e.g., 3 = SIGNIFICANT_DELAYS)
+    fetched_at      DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT PK_service_alerts PRIMARY KEY (alert_pk),
+    CONSTRAINT UQ_service_alerts_poll UNIQUE (entity_id, fetched_at)
+);
+GO
 
--- Result of the query: [('High Frequency', 23340, 45.24),
--- ('Medium Frequency', 17877, 34.65),
--- ('Low Frequency/Special', 10376, 20.11)]
+-- ── 7. alert_active_periods — Active Time Windows ─────────────────────────
+CREATE TABLE dbo.alert_active_periods (
+    id              INT IDENTITY(1,1) NOT NULL,
+    alert_pk        INT           NOT NULL,
+    period_start    DATETIME2     NULL,
+    period_end      DATETIME2     NULL,
+    CONSTRAINT PK_alert_active_periods PRIMARY KEY (id),
+    CONSTRAINT FK_active_period_alert FOREIGN KEY (alert_pk)
+        REFERENCES dbo.service_alerts (alert_pk) ON DELETE CASCADE
+);
+GO
 
+-- ── 8. alert_texts — Multilingual Translation Strings ──────────────────────
+CREATE TABLE dbo.alert_texts (
+    id              INT IDENTITY(1,1) NOT NULL,
+    alert_pk        INT           NOT NULL,
+    field_name      VARCHAR(20)   NOT NULL,   -- 'header' | 'description' | 'url'
+    language        VARCHAR(10)   NULL,       -- BCP-47 code ('fr', 'nl', 'en', 'de')
+    text_value      NVARCHAR(MAX) NULL,
+    CONSTRAINT PK_alert_texts PRIMARY KEY (id),
+    CONSTRAINT FK_alert_text_alert FOREIGN KEY (alert_pk)
+        REFERENCES dbo.service_alerts (alert_pk) ON DELETE CASCADE
+);
+GO
 
--- 5. The Accessibility Audit (Vehicle Features) 
--- Calculate the exact ratio and percentage of scheduled trips per route that explicitly guarantee wheelchair accessibility or bicycle storage (bikes_allowed). 
--- Which specific routes score the lowest in passenger amenity availability?
+-- ── 9. alert_informed_entities — Impacted Routes/Stations/Trips ────────────
+CREATE TABLE dbo.alert_informed_entities (
+    id                          INT IDENTITY(1,1) NOT NULL,
+    alert_pk                    INT           NOT NULL,
+    agency_id                   VARCHAR(30)   NULL,
+    route_id                    VARCHAR(50)   NULL,
+    route_type                  INT           NULL,
+    trip_id                     VARCHAR(100)  NULL,
+    trip_start_date             VARCHAR(8)    NULL,
+    trip_start_time             VARCHAR(8)    NULL,
+    trip_schedule_relationship  INT           NULL,
+    stop_id                     VARCHAR(50)   NULL,
+    CONSTRAINT PK_alert_informed_entities PRIMARY KEY (id),
+    CONSTRAINT FK_informed_entity_alert FOREIGN KEY (alert_pk)
+        REFERENCES dbo.service_alerts (alert_pk) ON DELETE CASCADE
+);
+GO
 
-WITH route_trip_counts AS (
-    SELECT
-        r.route_id,
-        COUNT(t.trip_id) AS total_trips,
-        SUM(CASE WHEN t.bikes_allowed = 1 THEN 1 ELSE 0 END) AS trips_with_bikes,
-        SUM(CASE WHEN t.wheelchair_accessible = 1 THEN 1 ELSE 0 END) AS trips_with_wheelchair,
-        SUM(CASE WHEN t.bikes_allowed = 1 OR t.wheelchair_accessible = 1 THEN 1 ELSE 0 END) AS trips_with_any_amenity
-    FROM
-        routes r
-    JOIN
-        trips t ON r.route_id = t.route_id
-    GROUP BY
-        r.route_id
-)
-SELECT
-    route_id,
-    total_trips,
-    trips_with_bikes,
-    trips_with_wheelchair,
-    trips_with_any_amenity,
-    ROUND(CAST(trips_with_bikes AS FLOAT) / total_trips, 4) AS ratio_bikes,
-    ROUND(CAST(trips_with_wheelchair AS FLOAT) / total_trips, 4) AS ratio_wheelchair,
-    ROUND(CAST(trips_with_any_amenity AS FLOAT) / total_trips, 4) AS ratio_any_amenity,
-    ROUND(100.0 * CAST(trips_with_bikes AS FLOAT) / total_trips, 2) AS percentage_bikes,
-    ROUND(100.0 * CAST(trips_with_wheelchair AS FLOAT) / total_trips, 2) AS percentage_wheelchair,
-    ROUND(100.0 * CAST(trips_with_any_amenity AS FLOAT) / total_trips, 2) AS percentage_any_amenity
-FROM
-    route_trip_counts
-LIMIT 20;
+-- ═══════════════════════ INDEXES FOR POWER BI PERFORMANCE ═══════════════════════
 
--- Result of the query: [('gr:nmbssncb:1', 1, 1, 0, 1, 1.0, 0.0, 1.0, 100.0, 0.0, 100.0),
--- ('gr:nmbssncb:10', 436, 436, 0, 436, 1.0, 0.0, 1.0, 100.0, 0.0, 100.0),
--- ('gr:nmbssncb:100', 31, 31, 0, 31, 1.0, 0.0, 1.0, 100.0, 0.0, 100.0),
--- ('gr:nmbssncb:1000', 3, 3, 0, 3, 1.0, 0.0, 1.0, 100.0, 0.0, 100.0),
--- ('gr:nmbssncb:1001', 2, 2, 0, 2, 1.0, 0.0, 1.0, 100.0, 0.0, 100.0),
--- ('gr:nmbssncb:1002', 4, 4, 0, 4, 1.0, 0.0, 1.0, 100.0, 0.0, 100.0),
--- ('gr:nmbssncb:1003', 1, 1, 0, 1, 1.0, 0.0, 1.0, 100.0, 0.0, 100.0),
--- ('gr:nmbssncb:1004', 15, 15, 0, 15, 1.0, 0.0, 1.0, 100.0, 0.0, 100.0),
--- ('gr:nmbssncb:1005', 10, 10, 0, 10, 1.0, 0.0, 1.0, 100.0, 0.0, 100.0),
--- ('gr:nmbssncb:1006', 10, 10, 0, 10, 1.0, 0.0, 1.0, 100.0, 0.0, 100.0),
--- ('gr:nmbssncb:1007', 2, 2, 0, 2, 1.0, 0.0, 1.0, 100.0, 0.0, 100.0),
--- ('gr:nmbssncb:1008', 1, 1, 0, 1, 1.0, 0.0, 1.0, 100.0, 0.0, 100.0),
--- ('gr:nmbssncb:1009', 787, 787, 0, 787, 1.0, 0.0, 1.0, 100.0, 0.0, 100.0),
--- ('gr:nmbssncb:101', 39, 39, 0, 39, 1.0, 0.0, 1.0, 100.0, 0.0, 100.0),
--- ('gr:nmbssncb:1010', 86, 86, 0, 86, 1.0, 0.0, 1.0, 100.0, 0.0, 100.0),
--- ('gr:nmbssncb:1011', 275, 275, 0, 275, 1.0, 0.0, 1.0, 100.0, 0.0, 100.0),
--- ('gr:nmbssncb:1012', 93, 93, 0, 93, 1.0, 0.0, 1.0, 100.0, 0.0, 100.0),
--- ('gr:nmbssncb:1013', 139, 139, 0, 139, 1.0, 0.0, 1.0, 100.0, 0.0, 100.0),
--- ('gr:nmbssncb:1014', 110, 110, 0, 110, 1.0, 0.0, 1.0, 100.0, 0.0, 100.0),
--- ('gr:nmbssncb:1015', 53, 53, 0, 53, 1.0, 0.0, 1.0, 100.0, 0.0, 100.0)]
-
+CREATE NONCLUSTERED INDEX IX_trip_updates_fetched_at ON dbo.trip_updates(fetched_at DESC);
+CREATE NONCLUSTERED INDEX IX_trip_updates_trip_id ON dbo.trip_updates(trip_id);
+CREATE NONCLUSTERED INDEX IX_trip_stop_updates_stop_id ON dbo.trip_stop_updates(stop_id);
+CREATE NONCLUSTERED INDEX IX_trip_stop_updates_update_pk ON dbo.trip_stop_updates(update_pk);
+GO
