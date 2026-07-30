@@ -19,7 +19,6 @@ def parse_long(value):
     others as a protobuf Long object {low, high, unsigned}. 
     This normalizes either into a plain int.
     """
-
     if value is None:
         return None
     if isinstance(value, dict):
@@ -33,7 +32,6 @@ def epoch_to_datetime(value):
     """Converts a GTFS-RT epoch-seconds value to a
     naive UTC datetime, ready for a DATETIME2 column.
     """
-
     epoch = parse_long(value)
     if epoch is None:
         return None
@@ -44,7 +42,6 @@ def fetch_feed(feed_name):
     """Fetches one GTFS-RT feed and returns its
     list of entities. Raises on a non-200 response.
     """
-
     url = BASE_URL + feed_name + "/"
     headers = {
         "Cache-Control": "no-cache",
@@ -61,24 +58,62 @@ def fetch_feed(feed_name):
 
 
 def get_connection():
+    """Establishes connection to Azure SQL Server.
+    Timeout is set to 60s to handle serverless cold-start delays.
+    """
     conn_str = (
         "Driver={ODBC Driver 18 for SQL Server};"
         f"Server=tcp:{os.environ['SQL_SERVER']},1433;"
         f"Database={os.environ['SQL_DB']};"
         f"Uid={os.environ['SQL_USER']};"
         f"Pwd={os.environ['SQL_PW']};"
-        "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;"
+        "Encrypt=yes;TrustServerCertificate=no;Connection Timeout=60;"
     )
     return pyodbc.connect(conn_str)
 
 
+def resolve_station_ids(cursor, station_input):
+    """Resolves a station name (e.g., 'Brussels' or 'Gent') or stop ID (e.g., '8813003')
+    into a set of matching stop_ids from dbo.dim_stations.
+    """
+    if not station_input:
+        return None
+
+    station_str = str(station_input).strip()
+
+    # If it is already a purely numeric ID, use it directly
+    if station_str.isdigit():
+        return {station_str}
+
+    # Otherwise, search dim_stations for matching station names
+    cursor.execute(
+        "SELECT stop_id FROM dbo.dim_stations WHERE stop_name LIKE ?",
+        (f"%{station_str}%",)
+    )
+    rows = cursor.fetchall()
+    return {str(row[0]) for row in rows}
+
+
 # ── Trip updates ─────────────────────────────────────────────────────────
 
-def insert_trip_updates(cursor, entities):
+def insert_trip_updates(cursor, entities, target_stop_ids=None):
+    inserted_count = 0
+
     for ent in entities:
         tu = ent.get("tripUpdate")
         if not tu:
             continue
+
+        stop_updates = tu.get("stopTimeUpdate", [])
+
+        # Filter by set of resolved stop_ids if provided
+        if target_stop_ids:
+            matching_stops = [
+                stu for stu in stop_updates
+                if str(stu.get("stopId", "")) in target_stop_ids
+            ]
+            if not matching_stops:
+                continue  # Skip train if it doesn't stop at any target station
 
         trip = tu.get("trip", {}) or {}
         vehicle = tu.get("vehicle", {}) or {}
@@ -106,9 +141,14 @@ def insert_trip_updates(cursor, entities):
         )
         update_pk = cursor.fetchone()[0]
 
-        for stu in tu.get("stopTimeUpdate", []):
+        for stu in stop_updates:
             arrival = stu.get("arrival", {}) or {}
             departure = stu.get("departure", {}) or {}
+
+            # Fallback to 0 for stopSequence if missing/null in feed
+            stop_seq = stu.get("stopSequence")
+            if stop_seq is None:
+                stop_seq = 0
 
             cursor.execute(
                 """
@@ -119,7 +159,7 @@ def insert_trip_updates(cursor, entities):
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 update_pk,
-                stu.get("stopSequence"),
+                stop_seq,
                 stu.get("stopId"),
                 epoch_to_datetime(arrival.get("time")),
                 arrival.get("delay"),
@@ -127,11 +167,17 @@ def insert_trip_updates(cursor, entities):
                 departure.get("delay"),
                 stu.get("scheduleRelationship"),
             )
+        
+        inserted_count += 1
+
+    return inserted_count
 
 
 # ── Alerts ───────────────────────────────────────────────────────────────
 
 def insert_alerts(cursor, entities):
+    inserted_count = 0
+
     for ent in entities:
         alert = ent.get("alert")
         if not alert:
@@ -198,6 +244,10 @@ def insert_alerts(cursor, entities):
                 trip.get("scheduleRelationship"),
                 informed.get("stopId"),
             )
+        
+        inserted_count += 1
+
+    return inserted_count
 
 
 # ── HTTP trigger ─────────────────────────────────────────────────────────
@@ -206,6 +256,9 @@ def insert_alerts(cursor, entities):
 def fetch_liveboard(req: func.HttpRequest) -> func.HttpResponse:
     logging.info("Starting liveboard fetch")
 
+    # Read optional station query parameter (e.g., ?station=Brussels or ?station=8813003)
+    station_filter = req.params.get("station")
+
     try:
         trip_entities = fetch_feed("trip-update")
         alert_entities = fetch_feed("alert")
@@ -213,8 +266,11 @@ def fetch_liveboard(req: func.HttpRequest) -> func.HttpResponse:
         conn = get_connection()
         cursor = conn.cursor()
 
-        insert_trip_updates(cursor, trip_entities)
-        insert_alerts(cursor, alert_entities)
+        # Resolve station name/ID into matching stop_ids from dim_stations
+        matched_stop_ids = resolve_station_ids(cursor, station_filter)
+
+        trips_inserted = insert_trip_updates(cursor, trip_entities, target_stop_ids=matched_stop_ids)
+        alerts_inserted = insert_alerts(cursor, alert_entities)
 
         conn.commit()
         cursor.close()
@@ -223,8 +279,11 @@ def fetch_liveboard(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(
             json.dumps({
                 "status": "ok",
-                "trip_updates_processed": len(trip_entities),
-                "alerts_processed": len(alert_entities),
+                "station_filter": station_filter or "None (Full Network)",
+                "resolved_stop_ids_count": len(matched_stop_ids) if matched_stop_ids else 0,
+                "total_trips_fetched": len(trip_entities),
+                "trips_inserted": trips_inserted,
+                "alerts_processed": alerts_inserted,
             }),
             mimetype="application/json",
             status_code=200,
