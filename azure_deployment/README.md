@@ -35,7 +35,7 @@ azure_deployment/
 
 - `function_app.py` is the Azure Function itself (Functions Python v2 model, HTTP trigger). On each invocation, it fetches both feeds from the BMC API, parses the JSON, and inserts rows into Azure SQL — parent rows first, then children, using `OUTPUT INSERTED.<pk>` to capture the generated surrogate key for each parent and use it as the foreign key on its children.
 - `host.json` / `local.settings.json` hold the Functions runtime configuration and local-only environment variables respectively (see [Usage](#-usage) for the required variables. `local.settings.json` is gitignored and never committed).
-- `queries.sql` contains ad-hoc validation queries used to sanity-check the pipeline against Azure SQL during development (row counts, parent-child linkage checks, etc.), rather than the analytical queries from the static-feed sprint.
+- `queries.sql` is the schema DDL for this sprint. It drops (in dependency order, children before parents) and recreates all six tables in Azure SQL, with explicit `PRIMARY KEY` / `FOREIGN KEY` constraints. Unlike the static-feed sprint, this file defines structure rather than running analytical queries.
 - `requirements.txt` lists the only external dependency, `pyodbc`, needed to connect to Azure SQL from Python.
 
 ## 🔀 Database structure
