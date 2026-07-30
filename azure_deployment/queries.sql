@@ -1,7 +1,5 @@
--- RailPulse Azure Challenge — GTFS-Realtime Schema (fully normalized)
 -- Covers: /rt/trip-update and /rt/alert feeds, matching their actual JSON shape.
 -- Run against your Azure SQL Database (serverless tier).
--- Safe to re-run: drops tables if they exist, in dependency order.
 
 -- ── Drop existing tables (children before parents) ─────────────────────────
 IF OBJECT_ID('dbo.trip_stop_updates', 'U')       IS NOT NULL DROP TABLE dbo.trip_stop_updates;
