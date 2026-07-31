@@ -1,131 +1,156 @@
--- Covers: /rt/trip-update and /rt/alert feeds, matching their actual JSON shape.
--- Run against your Azure SQL Database (serverless tier).
+-- ═══════════════════════════════════════════════════════════════════════════
+-- RAILPULSE CLOUD DATA WAREHOUSE: UNIFIED GTFS STATIC & REALTIME SCHEMA
+-- Target DB: Azure SQL Serverless
+-- ═══════════════════════════════════════════════════════════════════════════
 
--- ── Drop existing tables (children before parents) ─────────────────────────
+-- ── 0. Drop existing tables (Facts first, then Dimensions) ─────────────────
 IF OBJECT_ID('dbo.trip_stop_updates', 'U')       IS NOT NULL DROP TABLE dbo.trip_stop_updates;
 IF OBJECT_ID('dbo.alert_informed_entities', 'U') IS NOT NULL DROP TABLE dbo.alert_informed_entities;
 IF OBJECT_ID('dbo.alert_texts', 'U')             IS NOT NULL DROP TABLE dbo.alert_texts;
 IF OBJECT_ID('dbo.alert_active_periods', 'U')    IS NOT NULL DROP TABLE dbo.alert_active_periods;
 IF OBJECT_ID('dbo.trip_updates', 'U')            IS NOT NULL DROP TABLE dbo.trip_updates;
 IF OBJECT_ID('dbo.service_alerts', 'U')          IS NOT NULL DROP TABLE dbo.service_alerts;
+
+IF OBJECT_ID('dbo.dim_trips', 'U')               IS NOT NULL DROP TABLE dbo.dim_trips;
+IF OBJECT_ID('dbo.dim_routes', 'U')              IS NOT NULL DROP TABLE dbo.dim_routes;
+IF OBJECT_ID('dbo.dim_stations', 'U')            IS NOT NULL DROP TABLE dbo.dim_stations;
 GO
 
--- ═══════════════════════ TRIP UPDATES ═══════════════════════
+-- ═══════════════════════ DIMENSION TABLES (GTFS-STATIC) ═══════════════════════
 
--- ── 1. trip_updates — one row per tripUpdate entity, per poll ───────────────
+-- ── 1. dim_stations — Station & Platform Metadata ─────────────────────────
+CREATE TABLE dbo.dim_stations (
+    stop_id             VARCHAR(50)   NOT NULL,   -- GTFS stop_id, e.g. '8813003'
+    stop_name           NVARCHAR(150) NOT NULL,   -- e.g. 'Brussel-Centraal / Bruxelles-Central'
+    parent_station      VARCHAR(50)   NULL,       -- Parent hub ID for platforms
+    platform_code       VARCHAR(20)   NULL,       -- Platform number (e.g. '3', '4')
+    wheelchair_boarding INT           NULL,       -- 0 = No info, 1 = Accessible, 2 = Not accessible
+    CONSTRAINT PK_dim_stations PRIMARY KEY (stop_id)
+);
+GO
+
+-- ── 2. dim_routes — Line & Route Metadata ──────────────────────────────────
+CREATE TABLE dbo.dim_routes (
+    route_id            VARCHAR(50)   NOT NULL,   -- e.g. 'gr:nmbssncb:10'
+    agency_id           VARCHAR(30)   NULL,
+    route_short_name    NVARCHAR(50)  NULL,       -- e.g. 'IC-01'
+    route_long_name     NVARCHAR(200) NULL,       -- e.g. 'Eupen -- Oostende'
+    route_type          INT           NOT NULL,   -- GTFS route type (2 = Rail)
+    CONSTRAINT PK_dim_routes PRIMARY KEY (route_id)
+);
+GO
+
+-- ── 3. dim_trips — Scheduled Trip Reference ───────────────────────────────
+CREATE TABLE dbo.dim_trips (
+    trip_id             VARCHAR(100)  NOT NULL,   -- GTFS static trip_id
+    route_id            VARCHAR(50)   NOT NULL,
+    service_id          VARCHAR(50)   NOT NULL,   -- Operating calendar service key
+    trip_headsign       NVARCHAR(150) NULL,       -- Destination shown on train (e.g. 'Anvers-Central')
+    bikes_allowed       INT           NULL,       -- 0 = No info, 1 = Allowed, 2 = Not allowed
+    wheelchair_accessible INT         NULL,       -- 0 = No info, 1 = Accessible, 2 = Not accessible
+    CONSTRAINT PK_dim_trips PRIMARY KEY (trip_id),
+    CONSTRAINT FK_dim_trips_routes FOREIGN KEY (route_id) REFERENCES dbo.dim_routes (route_id)
+);
+GO
+
+
+-- ═══════════════════════ FACT TABLES (GTFS-REALTIME) ═══════════════════════
+
+-- ── 4. trip_updates — Liveboard Trip Header Telemetry ─────────────────────
 CREATE TABLE dbo.trip_updates (
-    update_pk               INT IDENTITY(1,1) NOT NULL,
-    entity_id                VARCHAR(100)  NOT NULL,   -- entity.id, e.g. 'rs:tec:90a2253b-...'
-    trip_id                   VARCHAR(100)  NOT NULL,   -- trip.tripId
-    route_id                  VARCHAR(50)   NULL,       -- trip.routeId
-    start_date                VARCHAR(8)    NULL,       -- trip.startDate (YYYYMMDD)
-    start_time                VARCHAR(8)    NULL,       -- trip.startTime (HH:MM:SS)
-    trip_schedule_relationship INT           NULL,       -- trip.scheduleRelationship, RAW numeric
-                                                          -- code (0 = SCHEDULED observed). Don't
-                                                          -- pre-map to text in Python — map at query
-                                                          -- time instead, once you trust the codes.
-    vehicle_id                VARCHAR(50)   NULL,       -- vehicle.id
-    vehicle_label              VARCHAR(50)   NULL,       -- vehicle.label
-    license_plate              VARCHAR(20)   NULL,       -- vehicle.licensePlate
-    overall_delay              INT           NULL,       -- tripUpdate.delay
-    update_timestamp            DATETIME2     NULL,       -- tripUpdate.timestamp, converted from epoch
+    update_pk                   INT IDENTITY(1,1) NOT NULL,
+    entity_id                   VARCHAR(100)  NOT NULL,   -- GTFS-RT entity ID
+    trip_id                     VARCHAR(100)  NOT NULL,   -- Links to dim_trips.trip_id
+    route_id                    VARCHAR(50)   NULL,       -- Links to dim_routes.route_id
+    start_date                  VARCHAR(8)    NULL,       -- YYYYMMDD
+    start_time                  VARCHAR(8)    NULL,       -- HH:MM:SS
+    trip_schedule_relationship  INT           NULL,       -- GTFS-RT numeric code (0 = SCHEDULED)
+    vehicle_id                  VARCHAR(50)   NULL,
+    vehicle_label               VARCHAR(50)   NULL,
+    license_plate               VARCHAR(20)   NULL,
+    overall_delay               INT           NULL,       -- Delay in seconds across entire trip
+    update_timestamp            DATETIME2     NULL,       -- Feed snapshot generation time (UTC)
     fetched_at                  DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
     CONSTRAINT PK_trip_updates PRIMARY KEY (update_pk)
 );
 GO
 
--- ── 2. trip_stop_updates — one row per stopTimeUpdate item ──────────────────
+-- ── 5. trip_stop_updates — Station-Level Arrival/Departure Delays ─────────
 CREATE TABLE dbo.trip_stop_updates (
-    id                     INT IDENTITY(1,1) NOT NULL,
-    update_pk               INT           NOT NULL,
-    stop_sequence            INT           NOT NULL,   -- stopTimeUpdate.stopSequence
-    stop_id                   VARCHAR(50)   NOT NULL,   -- stopTimeUpdate.stopId
-    arrival_time              DATETIME2     NULL,       -- arrival.time, converted from epoch
-    arrival_delay             INT           NULL,       -- arrival.delay
-    departure_time            DATETIME2     NULL,       -- departure.time, converted from epoch
-    departure_delay           INT           NULL,       -- departure.delay
-    schedule_relationship     INT           NULL,       -- stopTimeUpdate.scheduleRelationship, RAW
-                                                          -- numeric code.
+    id                      INT IDENTITY(1,1) NOT NULL,
+    update_pk                INT           NOT NULL,   -- Parent FK to trip_updates
+    stop_sequence           INT           NOT NULL,   -- Sequential stop index in trip
+    stop_id                  VARCHAR(50)   NOT NULL,   -- Links to dim_stations.stop_id
+    arrival_time             DATETIME2     NULL,       -- Scheduled/estimated arrival (UTC)
+    arrival_delay            INT           NULL,       -- Arrival delay in seconds
+    departure_time           DATETIME2     NULL,       -- Scheduled/estimated departure (UTC)
+    departure_delay          INT           NULL,       -- Departure delay in seconds
+    schedule_relationship    INT           NULL,
     CONSTRAINT PK_trip_stop_updates PRIMARY KEY (id),
     CONSTRAINT FK_stop_update_trip FOREIGN KEY (update_pk)
-        REFERENCES dbo.trip_updates (update_pk)
+        REFERENCES dbo.trip_updates (update_pk) ON DELETE CASCADE
 );
 GO
 
--- ═══════════════════════ SERVICE ALERTS ═══════════════════════
-
--- ── 3. service_alerts — one row per alert entity, per poll ──────────────────
+-- ── 6. service_alerts — Live Network Disruption Events ────────────────────
 CREATE TABLE dbo.service_alerts (
-    alert_pk       INT IDENTITY(1,1) NOT NULL,
-    entity_id       VARCHAR(100)  NOT NULL,     -- entity.id
-    cause           INT           NULL,         -- alert.cause, RAW numeric code. Do not
-                                                  -- pre-map to text — observed values don't
-                                                  -- clearly match the standard GTFS-RT enum
-                                                  -- (e.g. cause=1 alongside a very specific
-                                                  -- described cause), so guessing a label here
-                                                  -- risks mislabeling. Map at query time once
-                                                  -- you've cross-checked enough real examples.
-    effect          INT           NULL,         -- alert.effect, RAW numeric code (3 =
-                                                  -- SIGNIFICANT_DELAYS matched the observed
-                                                  -- sample, but still verify at query time
-                                                  -- rather than trusting it during ingestion)
+    alert_pk        INT IDENTITY(1,1) NOT NULL,
+    entity_id       VARCHAR(100)  NOT NULL,
+    cause           INT           NULL,         -- GTFS-RT alert cause code
+    effect          INT           NULL,         -- GTFS-RT alert effect code (e.g., 3 = SIGNIFICANT_DELAYS)
     fetched_at      DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
     CONSTRAINT PK_service_alerts PRIMARY KEY (alert_pk),
     CONSTRAINT UQ_service_alerts_poll UNIQUE (entity_id, fetched_at)
 );
 GO
 
--- ── 4. alert_active_periods — one row per activePeriod item ─────────────────
--- Split out because an alert can carry several date ranges
--- (e.g. recurring weekday disruptions), not just one.
+-- ── 7. alert_active_periods — Active Time Windows ─────────────────────────
 CREATE TABLE dbo.alert_active_periods (
-    id             INT IDENTITY(1,1) NOT NULL,
-    alert_pk       INT           NOT NULL,
-    period_start   DATETIME2     NULL,   -- activePeriod[].start, converted from epoch
-    period_end     DATETIME2     NULL,   -- activePeriod[].end, converted from epoch
+    id              INT IDENTITY(1,1) NOT NULL,
+    alert_pk        INT           NOT NULL,
+    period_start    DATETIME2     NULL,
+    period_end      DATETIME2     NULL,
     CONSTRAINT PK_alert_active_periods PRIMARY KEY (id),
     CONSTRAINT FK_active_period_alert FOREIGN KEY (alert_pk)
-        REFERENCES dbo.service_alerts (alert_pk)
+        REFERENCES dbo.service_alerts (alert_pk) ON DELETE CASCADE
 );
 GO
 
--- ── 5. alert_texts — one row per (field, language) translation ──────────────
--- Same polymorphic shape as the static GTFS translations.txt from last
--- sprint: headerText, descriptionText, and url each carry their own
--- translation[] array of {language, text}.
+-- ── 8. alert_texts — Multilingual Translation Strings ──────────────────────
 CREATE TABLE dbo.alert_texts (
-    id           INT IDENTITY(1,1) NOT NULL,
-    alert_pk     INT           NOT NULL,
-    field_name   VARCHAR(20)   NOT NULL,   -- 'header' | 'description' | 'url'
-    language     VARCHAR(10)   NULL,       -- BCP-47 code, e.g. 'en', 'fr', 'nl'
-    text_value   NVARCHAR(MAX) NULL,       -- NVARCHAR(MAX): descriptions can be long,
-                                             -- and carry French/Dutch/German accents
+    id              INT IDENTITY(1,1) NOT NULL,
+    alert_pk        INT           NOT NULL,
+    field_name      VARCHAR(20)   NOT NULL,   -- 'header' | 'description' | 'url'
+    language        VARCHAR(10)   NULL,       -- BCP-47 code ('fr', 'nl', 'en', 'de')
+    text_value      NVARCHAR(MAX) NULL,
     CONSTRAINT PK_alert_texts PRIMARY KEY (id),
     CONSTRAINT FK_alert_text_alert FOREIGN KEY (alert_pk)
-        REFERENCES dbo.service_alerts (alert_pk)
+        REFERENCES dbo.service_alerts (alert_pk) ON DELETE CASCADE
 );
 GO
 
--- ── 6. alert_informed_entities — one row per informedEntity item ────────────
--- Surrogate IDENTITY key required: route_id / trip fields / stop_id are all
--- individually optional depending on the alert's scope, and SQL Server
--- disallows NULLs in primary key columns.
+-- ── 9. alert_informed_entities — Impacted Routes/Stations/Trips ────────────
 CREATE TABLE dbo.alert_informed_entities (
     id                          INT IDENTITY(1,1) NOT NULL,
     alert_pk                    INT           NOT NULL,
-    agency_id                    VARCHAR(30)   NULL,   -- informedEntity.agencyId
-    route_id                     VARCHAR(50)   NULL,   -- informedEntity.routeId
-    route_type                   INT           NULL,   -- informedEntity.routeType
-    trip_id                       VARCHAR(100)  NULL,   -- informedEntity.trip.tripId
-    trip_start_date                VARCHAR(8)    NULL,   -- informedEntity.trip.startDate
-    trip_start_time                VARCHAR(8)    NULL,   -- informedEntity.trip.startTime
-    trip_schedule_relationship      INT           NULL,   -- informedEntity.trip.scheduleRelationship, raw code
-    stop_id                          VARCHAR(50)   NULL,   -- not present in this API's documented
-                                                             -- schema, kept nullable in case it
-                                                             -- appears in practice — verify before
-                                                             -- relying on it
+    agency_id                   VARCHAR(30)   NULL,
+    route_id                    VARCHAR(50)   NULL,
+    route_type                  INT           NULL,
+    trip_id                     VARCHAR(100)  NULL,
+    trip_start_date             VARCHAR(8)    NULL,
+    trip_start_time             VARCHAR(8)    NULL,
+    trip_schedule_relationship  INT           NULL,
+    stop_id                     VARCHAR(50)   NULL,
     CONSTRAINT PK_alert_informed_entities PRIMARY KEY (id),
     CONSTRAINT FK_informed_entity_alert FOREIGN KEY (alert_pk)
-        REFERENCES dbo.service_alerts (alert_pk)
+        REFERENCES dbo.service_alerts (alert_pk) ON DELETE CASCADE
 );
+GO
+
+-- ═══════════════════════ INDEXES FOR POWER BI PERFORMANCE ═══════════════════════
+
+CREATE NONCLUSTERED INDEX IX_trip_updates_fetched_at ON dbo.trip_updates(fetched_at DESC);
+CREATE NONCLUSTERED INDEX IX_trip_updates_trip_id ON dbo.trip_updates(trip_id);
+CREATE NONCLUSTERED INDEX IX_trip_stop_updates_stop_id ON dbo.trip_stop_updates(stop_id);
+CREATE NONCLUSTERED INDEX IX_trip_stop_updates_update_pk ON dbo.trip_stop_updates(update_pk);
 GO
