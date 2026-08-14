@@ -9,6 +9,7 @@
 
 ## 📑 Contents
 - [Description](#-description)
+- [Screenshot](#️-screenshot)
 - [Repo structure](#-repo-structure)
 - [Database structure](#-database-structure)
 - [Text-to-SQL pipeline](#-text-to-sql-pipeline)
@@ -37,11 +38,17 @@ serves `llama-3.3-70b-versatile`, LangChain (LCEL) wires the two chains
 together, ChromaDB provides local few-shot retrieval, and Chainlit provides
 the chat UI — no paid third-party API is required to run or demo the project.
 
+## 🖼️ Screenshot
+
+![agent_screenshot](./assets/agent_screenshot.png)
+
+
 ## 📦 Repo structure
 
 ```
 04_genai_chatbot/
 ├── assets/
+│   ├── agent_screenshot.png
 │   └── db-structure.png
 ├── utils/
 │   ├── consultant.py
@@ -58,7 +65,7 @@ the chat UI — no paid third-party API is required to run or demo the project.
 ├── app.py
 ├── chainlit.md
 ├── railpulse_snapshot.db
-├── README.md│   
+├── README.md
 └── requirements.txt
 ```
 
