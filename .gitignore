@@ -220,3 +220,6 @@ __marimo__/
 .DS_Store
 
 .vscode/
+chroma_few_shot_db/
+.chainlit/
+local.settings.json
