@@ -26,7 +26,7 @@ railpulse/
 ├── 01_liveboard_sql/        # Sprint 1 — static GTFS → SQLite
 ├── 02_azure_deployment/     # Sprint 2 — live GTFS-RT → Azure SQL
 ├── 03_powerbi_dashboard/    # Sprint 3 — Power BI dashboard on Azure SQL
-├── 04_genai_chatbot/        # Sprint 4/5 — text-to-SQL AI chatbot
+├── 04_genai_chatbot/        # Sprint 4 — text-to-SQL AI chatbot
 └── README.md                # you are here
 ```
 
@@ -38,22 +38,36 @@ railpulse/
 | 1 | **[RailPulse](./01_liveboard_sql/)** | Parses the static SNCB/GTFS feed with stdlib-only Python (no pandas) and builds a normalized SQLite database, then answers five operational questions in SQL. | `sqlite3` |
 | 2 | **[RailPulse Cloud](./02_azure_deployment/)** | Moves ingestion to an Azure Function that polls the live GTFS-RT feed and writes normalized rows into an Azure SQL star schema, seeded with static GTFS dimensions. | Azure Functions, Azure SQL, `pyodbc` |
 | 3 | **[RailPulse Analytics](./03_powerbi_dashboard/)** | A two-page Power BI dashboard on top of the Sprint 2 schema, covering network-wide punctuality, train-category delay burden, and platform-level congestion. | Power BI (web), DAX |
-| 4/5 | **[RailPulse AI](./04_genai_chatbot/)** | A Chainlit chat app that turns plain-language questions into read-only SQL against a curated database snapshot, then rewrites the results to answer the questions and suggest follow-up actions for the train system managers. | Groq (Llama 3.3), LangChain LCEL, ChromaDB, Chainlit |
+| 4 | **[RailPulse AI](./04_genai_chatbot/)** | A Chainlit chat app that turns plain-language questions into read-only SQL against a curated database snapshot, then rewrites the results to answer the questions and suggest follow-up actions for the train system managers. | Groq (Llama 3.3), LangChain LCEL, ChromaDB, Chainlit |
 
 ## ⚙️ End-to-end pipeline
 
-```
-Static GTFS feed              Live GTFS-RT feed
-      │                              │
-      ▼                              ▼
-Sprint 1: SQLite            Sprint 2: Azure Function
-(stdlib-only ETL)         → Azure SQL star schema
-                                     │
-                    ┌────────────────┼─────────────────┐
-                    ▼                                   ▼
-        Sprint 3: Power BI dashboard      Sprint 4: text-to-SQL chatbot
-        (live connection to Azure SQL)    (one-time snapshot → local SQLite,
-                                           see that sprint's README for why)
+```mermaid
+flowchart TD
+    A[Static GTFS feed] --> B
+    C[Live GTFS-RT feed] --> D
+ 
+    subgraph S1 ["Sprint 1"]
+        B[SQLite<br/>stdlib-only ETL]
+    end
+ 
+    subgraph S2 ["Sprint 2"]
+        D[Azure Function] --> E[Azure SQL star schema]
+    end
+ 
+    E --> F
+    E --> G
+ 
+    subgraph S3 ["Sprint 3"]
+        F[Power BI dashboard<br/>live connection to Azure SQL]
+    end
+ 
+    subgraph S45 ["Sprint 4"]
+        G[Text-to-SQL chatbot<br/>one-time snapshot ➔ local SQLite]
+    end
+ 
+    style A fill:#f9f9f9,stroke:#333,stroke-width:1px
+    style C fill:#f9f9f9,stroke:#333,stroke-width:1px
 ```
 
 Each sprint's README documents its own design decisions, known limitations, and usage instructions in full.
